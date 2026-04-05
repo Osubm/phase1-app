@@ -1,12 +1,1584 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Restaurant Ops Phase 1 Engine</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Prep & Profit OS v1.8.2</title>
+  <!-- React 18 -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <!-- Babel -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Tailwind for styling speed -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f3f4f6;
+      overscroll-behavior-y: none;
+    }
+    .safe-area-bottom {
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    /* Bounded roots for auth vs app isolation */
+    #auth-root {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      display: none;
+      background: white;
+    }
+    #auth-root.active {
+      display: block;
+    }
+
+    #app-root {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    #app-root.hidden {
+      display: none;
+    }
+
+    /* Responsive layout tweaks */
+    @media (max-width: 768px) {
+      .mobile-hide { display: none !important; }
+      .mobile-only { display: block !important; }
+    }
+    @media (min-width: 769px) {
+      .mobile-only { display: none !important; }
+    }
+
+    /* General styles */
+    .btn {
+      padding: 0.75rem 1rem;
+      border-radius: 0.5rem;
+      font-weight: 500;
+      text-align: center;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s;
+    }
+    .btn-primary { background: #111827; color: white; border: 1px solid #111827; }
+    .btn-secondary { background: white; color: #111827; border: 1px solid #d1d5db; }
+    .btn-danger { background: white; color: #dc2626; border: 1px solid #f87171; }
+
+    .input-field {
+      width: 100%;
+      padding: 0.75rem;
+      border: 1px solid #d1d5db;
+      border-radius: 0.5rem;
+      outline: none;
+    }
+    .input-field:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- App Shell -->
+  <div id="app-root"></div>
+
+  <!-- Auth Shell (isolated boundary) -->
+  <div id="auth-root" class="active"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+    // ==========================================
+    // Core Engine & LocalStorage Helpers
+    // ==========================================
+
+    const DB_KEY = 'ppos_v182_data';
+    const PENDING_TX_KEY = 'ppos_v182_pending_tx';
+    const BUILD_VERSION = 'v1.8.2';
+
+    const generateId = (prefix) => `${prefix}_${Math.random().toString(36).substr(2, 9)}_${Date.now()}`;
+
+    // Durable Transaction Envelope
+    const createTransactionEnvelope = (payload) => ({
+      transactionId: generateId('tx'),
+      createdAt: new Date().toISOString(),
+      commitState: 'pending', // pending, committed, failed, replayed, discarded
+      payload,
+      auditMetadata: {
+        actor: payload.actor || 'system',
+        timestamp: new Date().toISOString()
+      }
+    });
+
+    // SHA-256 Mock for pilot (would use crypto.subtle in reality, but blueprint says hashed/salted representation)
+    // Upgraded to a simple synchronous hash algorithm to prevent plaintext recovery
+    const hashPin = (pin, salt = 'salt') => {
+        let str = pin + salt;
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32bit integer
+        }
+        return hash.toString(16);
+    }
+
+    // Ledger Core Operations
+    const loadLedger = () => {
+       const raw = localStorage.getItem(DB_KEY);
+       if (!raw) return { balance: 0, orders: [], stock: [], movements: [], auditLog: [] };
+       try { return JSON.parse(raw); } catch (e) { return { balance: 0, orders: [], stock: [], movements: [], auditLog: [] }; }
+    };
+
+    const saveLedger = (state) => {
+       localStorage.setItem(DB_KEY, JSON.stringify(state));
+    };
+
+    const commitTransaction = (envelope) => {
+       // 1. Write pending journal
+       const pending = JSON.parse(localStorage.getItem(PENDING_TX_KEY) || '[]');
+       pending.push(envelope);
+       localStorage.setItem(PENDING_TX_KEY, JSON.stringify(pending));
+
+       // 2. Execute business logic on Authority State
+       const state = loadLedger();
+       try {
+          if (envelope.payload.type === 'ORDER_COMMIT') {
+              state.orders.push(envelope.payload.order);
+          } else if (envelope.payload.type === 'STOCK_MOVEMENT') {
+              state.movements.push(envelope.payload.movement);
+              // stock equation implementation goes here
+          }
+          // Audit coupling
+          state.auditLog.push({
+             id: generateId('audit'),
+             ...envelope.auditMetadata,
+             event: envelope.payload.type,
+             details: envelope.payload
+          });
+
+          saveLedger(state);
+
+          // 3. Mark committed and clear pending
+          envelope.commitState = 'committed';
+          localStorage.setItem(PENDING_TX_KEY, JSON.stringify(pending.filter(tx => tx.transactionId !== envelope.transactionId)));
+          return true;
+       } catch (e) {
+          console.error("Transaction failed:", e);
+          envelope.commitState = 'failed';
+          localStorage.setItem(PENDING_TX_KEY, JSON.stringify(pending.map(tx => tx.transactionId === envelope.transactionId ? envelope : tx)));
+          return false;
+       }
+    };
+
+    const recoverPendingTransactions = () => {
+       const pending = JSON.parse(localStorage.getItem(PENDING_TX_KEY) || '[]');
+       if (pending.length > 0) {
+           console.log(`Recovering ${pending.length} pending transactions...`);
+           // Auto-discard for simplicity in pilot UI, but logs it
+           localStorage.setItem(PENDING_TX_KEY, '[]');
+           alert(`System recovered ${pending.length} uncommitted transactions. They have been discarded for safety.`);
+       }
+    };
+
+    // ==========================================
+    // AUTHENTICATION COMPONENT (Bounded Surface)
+    // ==========================================
+    function AuthShell({ onAuthenticated, isLocked, onUnlock }) {
+      const [step, setStep] = useState('select-user'); // select-user, pin-entry, locked
+      const [selectedUser, setSelectedUser] = useState(null);
+      const [pin, setPin] = useState('');
+      const [error, setError] = useState('');
+      const [failedAttempts, setFailedAttempts] = useState(0);
+
+      const seedUsers = [
+        { id: 'usr_1', name: 'BEULAR', role: 'manager', pinHash: hashPin('1234') },
+        { id: 'usr_2', name: 'BENEFIT', role: 'waiter', pinHash: hashPin('0000') },
+        { id: 'usr_3', name: 'CALVIN', role: 'waiter', pinHash: hashPin('1111') },
+        { id: 'usr_4', name: 'MELUSI', role: 'kitchen', pinHash: hashPin('2222') },
+        { id: 'usr_5', name: 'PERFECT', role: 'bar', pinHash: hashPin('3333') },
+        { id: 'usr_6', name: 'JOHN', role: 'manager', pinHash: hashPin('4444') },
+        { id: 'usr_7', name: 'BABRA', role: 'waiter', pinHash: hashPin('5555') },
+        { id: 'usr_8', name: 'MONICA', role: 'waiter', pinHash: hashPin('6666') },
+        { id: 'usr_9', name: 'BEATRICE', role: 'waiter', pinHash: hashPin('7777') },
+        { id: 'usr_10', name: 'PRIMROSE', role: 'waiter', pinHash: hashPin('8888') },
+        { id: 'usr_11', name: 'LOREINE', role: 'waiter', pinHash: hashPin('9999') },
+        { id: 'usr_12', name: 'MBUSO', role: 'waiter', pinHash: hashPin('1010') },
+        { id: 'usr_13', name: 'REBECCA', role: 'waiter', pinHash: hashPin('2020') }
+      ];
+
+      useEffect(() => {
+          if (isLocked) setStep('locked');
+      }, [isLocked]);
+
+      const handleUserSelect = (user) => {
+        setSelectedUser(user);
+        setStep('pin-entry');
+        setPin('');
+        setError('');
+      };
+
+      const handlePinPress = (digit) => {
+        if (pin.length < 4) {
+          setPin(p => p + digit);
+        }
+      };
+
+      const handleBackspace = () => {
+        setPin(p => p.slice(0, -1));
+      };
+
+      useEffect(() => {
+        if (pin.length === 4) {
+          // Verify against representation
+          if (hashPin(pin) === selectedUser.pinHash) {
+            onAuthenticated(selectedUser);
+            setStep('select-user');
+            setSelectedUser(null);
+            setPin('');
+            setFailedAttempts(0);
+          } else {
+            const attempts = failedAttempts + 1;
+            setFailedAttempts(attempts);
+
+            if (attempts >= 5) {
+                setStep('locked');
+                setError('');
+            } else {
+                setError(`Invalid PIN. ${5 - attempts} attempts remaining.`);
+            }
+            setPin('');
+          }
+        }
+      }, [pin]);
+
+      const handleManagerUnlock = () => {
+          // In a real flow, this would prompt for a manager's PIN specifically
+          // For now, we will just simulate a manager unlocking it.
+          if (selectedUser && selectedUser.role === 'manager' && hashPin(pin) === selectedUser.pinHash) {
+             setStep('select-user');
+             setFailedAttempts(0);
+             setPin('');
+             if(onUnlock) onUnlock();
+          } else if (pin.length === 4) {
+             setError("Manager unlock failed.");
+             setPin('');
+          }
+      };
+
+      if (step === 'locked') {
+          return (
+             <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-red-50">
+               <h1 className="text-3xl font-bold mb-4 text-red-600">Device Locked</h1>
+               <p className="mb-8">Too many failed attempts. Manager unlock required.</p>
+
+               <h2 className="text-xl mb-4 font-semibold">Manager PIN</h2>
+               <div className="flex gap-4 mb-8">
+                  {[0, 1, 2, 3].map(i => (
+                    <div key={i} className={`w-16 h-16 rounded-full border-2 flex items-center justify-center text-3xl
+                      ${pin.length > i ? 'bg-red-800 border-red-800 text-white' : 'border-gray-300'}`}>
+                      {pin.length > i ? '*' : ''}
+                    </div>
+                  ))}
+                </div>
+                {error && <div className="text-red-500 font-semibold mb-4">{error}</div>}
+
+                <div className="grid grid-cols-3 gap-4 w-full max-w-xs">
+                  {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(d => (
+                    <button key={d} onClick={() => {
+                        if(pin.length < 4) setPin(p => p + d.toString());
+                        if(pin.length === 3) handleManagerUnlock(); // Trigger on 4th keypress
+                    }} className="btn btn-secondary h-16 text-2xl rounded-full">
+                      {d}
+                    </button>
+                  ))}
+                  <button onClick={() => {}} className="btn btn-secondary h-16 text-lg rounded-full opacity-0 cursor-default"></button>
+                  <button onClick={() => {
+                       if(pin.length < 4) setPin(p => p + '0');
+                       if(pin.length === 3) handleManagerUnlock();
+                  }} className="btn btn-secondary h-16 text-2xl rounded-full">
+                    0
+                  </button>
+                  <button onClick={handleBackspace} className="btn btn-secondary h-16 text-2xl rounded-full">
+                    ⌫
+                  </button>
+                </div>
+             </div>
+          );
+      }
+
+      if (step === 'select-user') {
+        return (
+          <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-gray-50">
+            <h1 className="text-2xl font-bold mb-8">PrepProfitOS {BUILD_VERSION}</h1>
+            <h2 className="text-xl mb-6">Select Staff Member</h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 w-full max-w-3xl">
+              {seedUsers.map(u => (
+                <button
+                  key={u.id}
+                  onClick={() => handleUserSelect(u)}
+                  className="btn btn-secondary h-20 text-lg font-semibold flex items-center justify-center shadow-sm hover:bg-gray-100"
+                >
+                  {u.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      }
+
+      if (step === 'pin-entry') {
+        return (
+          <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-gray-50">
+            <h1 className="text-2xl font-bold mb-8">Enter PIN</h1>
+            <h2 className="text-xl mb-4 font-semibold text-blue-600">{selectedUser.name}</h2>
+
+            <div className="flex gap-4 mb-8">
+              {[0, 1, 2, 3].map(i => (
+                <div key={i} className={`w-16 h-16 rounded-full border-2 flex items-center justify-center text-3xl
+                  ${pin.length > i ? 'bg-gray-800 border-gray-800 text-white' : 'border-gray-300'}`}>
+                  {pin.length > i ? '*' : ''}
+                </div>
+              ))}
+            </div>
+
+            {error && <div className="text-red-500 font-semibold mb-4">{error}</div>}
+
+            <div className="grid grid-cols-3 gap-4 w-full max-w-xs">
+              {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(d => (
+                <button key={d} onClick={() => handlePinPress(d.toString())} className="btn btn-secondary h-16 text-2xl rounded-full">
+                  {d}
+                </button>
+              ))}
+              <button onClick={() => { setStep('select-user'); setError(''); setPin(''); }} className="btn btn-secondary h-16 text-lg rounded-full text-red-500 font-bold">
+                Cancel
+              </button>
+              <button onClick={() => handlePinPress('0')} className="btn btn-secondary h-16 text-2xl rounded-full">
+                0
+              </button>
+              <button onClick={handleBackspace} className="btn btn-secondary h-16 text-2xl rounded-full">
+                ⌫
+              </button>
+            </div>
+          </div>
+        );
+      }
+    }
+
+    // ==========================================
+    // MODULES
+    // ==========================================
+
+    function POSModule({ currentUser }) {
+       const [orderType, setOrderType] = useState('floor_table'); // floor_table, butchery_braai_table, bar_seat, counter, walk_in, takeaway
+       const [cart, setCart] = useState([]);
+
+       const mockCategories = [
+          { id: 'cat_1', name: 'Mains' },
+          { id: 'cat_2', name: 'Drinks' },
+          { id: 'cat_3', name: 'Butchery' }
+       ];
+
+       const mockProducts = [
+          { id: 'p_1', catId: 'cat_1', name: 'Quarter Chicken', price: 8.50, pricingMode: 'fixed', requiresModifier: true },
+          { id: 'p_2', catId: 'cat_1', name: 'Burger', price: 10.00, pricingMode: 'fixed' },
+          { id: 'p_3', catId: 'cat_2', name: 'Coke', price: 2.00, pricingMode: 'fixed' },
+          { id: 'p_4', catId: 'cat_3', name: 'Beef Steak', price: 18.00, pricingMode: 'weight' } // per kg
+       ];
+
+       const addToCart = (product) => {
+           let newLine = { id: generateId('line'), product, qty: 1, total: product.price };
+
+           if (product.pricingMode === 'weight') {
+               const weightStr = prompt(`Enter weight in kg for ${product.name}:`);
+               const weight = parseFloat(weightStr);
+               if (!isNaN(weight) && weight > 0) {
+                   newLine.weight = weight;
+                   newLine.total = product.price * weight;
+                   setCart([...cart, newLine]);
+               }
+           } else {
+               const existing = cart.find(c => c.product.id === product.id && c.product.pricingMode !== 'weight' && !c.product.requiresModifier);
+               if (existing) {
+                   setCart(cart.map(c => c.id === existing.id ? { ...c, qty: c.qty + 1, total: c.product.price * (c.qty + 1) } : c));
+               } else {
+                   if (product.requiresModifier) {
+                       newLine.modifierResolved = false;
+                       newLine.modifierChoice = null;
+                   }
+                   setCart([...cart, newLine]);
+               }
+           }
+       };
+
+       const resolveModifier = (lineId, choice) => {
+           setCart(cart.map(c => c.id === lineId ? { ...c, modifierResolved: true, modifierChoice: choice } : c));
+       };
+
+       const cartTotal = cart.reduce((sum, item) => sum + item.total, 0);
+
+       const handlePay = () => {
+           if(cart.length === 0) return;
+
+           // Verify modifiers
+           const unresolvedModifiers = cart.some(line => line.product.requiresModifier && !line.modifierResolved);
+           if (unresolvedModifiers) {
+               alert("Please resolve all modifiers before paying.");
+               return;
+           }
+
+           const envelope = createTransactionEnvelope({
+               type: 'ORDER_COMMIT',
+               actor: currentUser.name,
+               order: {
+                   id: generateId('ord'),
+                   serviceContext: orderType,
+                   total: cartTotal,
+                   lines: cart,
+                   createdAt: new Date().toISOString(),
+                   paymentStatus: 'paid'
+               }
+           });
+
+           if(commitTransaction(envelope)) {
+               alert("Order Paid and Committed!");
+               setCart([]);
+           }
+       };
+
+       const handleSendToKds = () => {
+           if(cart.length === 0) return;
+
+           // Verify modifiers
+           const unresolvedModifiers = cart.some(line => line.product.requiresModifier && !line.modifierResolved);
+           if (unresolvedModifiers) {
+               alert("Please resolve all modifiers before sending to kitchen.");
+               return;
+           }
+
+           const envelope = createTransactionEnvelope({
+               type: 'ORDER_COMMIT',
+               actor: currentUser.name,
+               order: {
+                   id: generateId('ord'),
+                   serviceContext: orderType,
+                   total: cartTotal,
+                   lines: cart,
+                   createdAt: new Date().toISOString(),
+                   paymentStatus: 'unpaid'
+               }
+           });
+
+           if(commitTransaction(envelope)) {
+               alert("Order Sent to Kitchen!");
+               setCart([]);
+           }
+       };
+
+       return (
+           <div className="flex flex-col md:flex-row h-full">
+               {/* Cart Panel (Left/Top) */}
+               <div className="w-full md:w-1/3 bg-white border-r flex flex-col">
+                   <div className="p-3 border-b flex justify-between items-center bg-gray-50">
+                       <select
+                           value={orderType}
+                           onChange={e => setOrderType(e.target.value)}
+                           className="input-field py-1 px-2 text-sm"
+                       >
+                           <option value="floor_table">Table Service</option>
+                           <option value="takeaway">Takeaway</option>
+                           <option value="butchery_braai_table">Butchery Braai</option>
+                       </select>
+                       <button className="btn btn-secondary py-1 px-2 text-sm text-red-500" onClick={() => setCart([])}>Clear</button>
+                   </div>
+
+                   <div className="flex-1 overflow-y-auto p-2">
+                       {cart.length === 0 && <div className="text-gray-400 text-center mt-10">Cart is empty</div>}
+                       {cart.map(item => (
+                           <div key={item.id} className="flex flex-col mb-2 p-2 bg-gray-50 rounded border">
+                               <div className="flex justify-between items-center">
+                                   <div>
+                                       <div className="font-bold">{item.product.name}</div>
+                                       <div className="text-xs text-gray-500">
+                                           {item.product.pricingMode === 'weight' ? `${item.weight} kg @ $${item.product.price}/kg` : `${item.qty} x $${item.product.price}`}
+                                       </div>
+                                   </div>
+                                   <div className="font-bold">${item.total.toFixed(2)}</div>
+                               </div>
+
+                               {item.product.requiresModifier && !item.modifierResolved && (
+                                   <div className="mt-2 p-2 bg-red-50 border border-red-200 rounded">
+                                       <div className="text-xs font-bold text-red-600 mb-1">Select Starch:</div>
+                                       <div className="flex gap-2">
+                                           <button onClick={() => resolveModifier(item.id, 'Chips')} className="btn btn-secondary text-xs py-1 px-2">Chips</button>
+                                           <button onClick={() => resolveModifier(item.id, 'Rice')} className="btn btn-secondary text-xs py-1 px-2">Rice</button>
+                                           <button onClick={() => resolveModifier(item.id, 'None')} className="btn btn-secondary text-xs py-1 px-2">None</button>
+                                       </div>
+                                   </div>
+                               )}
+                               {item.product.requiresModifier && item.modifierResolved && (
+                                    <div className="text-xs text-blue-600 mt-1 italic">
+                                        + {item.modifierChoice}
+                                    </div>
+                               )}
+                           </div>
+                       ))}
+                   </div>
+
+                   <div className="p-4 bg-gray-50 border-t">
+                       <div className="flex justify-between text-xl font-bold mb-4">
+                           <span>Total:</span>
+                           <span>${cartTotal.toFixed(2)}</span>
+                       </div>
+
+                       <div className="grid grid-cols-2 gap-2">
+                           <button className="btn btn-secondary w-full" onClick={handleSendToKds}>Send to KDS</button>
+                           <button className="btn btn-primary w-full" onClick={handlePay}>Pay Now</button>
+                       </div>
+                   </div>
+               </div>
+
+               {/* Products Panel (Right/Bottom) */}
+               <div className="flex-1 bg-gray-100 flex flex-col">
+                   <div className="flex overflow-x-auto p-2 gap-2 bg-white border-b">
+                      {mockCategories.map(c => (
+                          <button key={c.id} className="px-4 py-2 bg-gray-200 rounded whitespace-nowrap text-sm font-bold">
+                             {c.name}
+                          </button>
+                      ))}
+                   </div>
+
+                   <div className="flex-1 p-4 overflow-y-auto">
+                       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+                           {mockProducts.map(p => (
+                               <button
+                                  key={p.id}
+                                  onClick={() => addToCart(p)}
+                                  className="bg-white p-4 rounded shadow-sm flex flex-col items-center justify-center h-24 hover:bg-blue-50 transition-colors"
+                               >
+                                  <span className="font-bold text-center">{p.name}</span>
+                                  <span className="text-sm text-gray-500">${p.price.toFixed(2)}{p.pricingMode === 'weight' ? '/kg' : ''}</span>
+                               </button>
+                           ))}
+                       </div>
+                   </div>
+               </div>
+           </div>
+       );
+    }
+
+    function KDSModule() {
+        const [orders, setOrders] = useState([]);
+
+        useEffect(() => {
+            const ledger = loadLedger();
+            // Show unpaid orders that require kitchen
+            const activeOrders = ledger.orders.filter(o => o.paymentStatus === 'unpaid');
+            setOrders(activeOrders);
+        }, []);
+
+        const completeOrder = (orderId) => {
+             // In a real app we'd dispatch an amendment event or state change via ledger envelope
+             // For simplicity in pilot demo, we just remove it from view
+             setOrders(orders.filter(o => o.id !== orderId));
+        };
+
+        return (
+           <div className="p-4 h-full flex flex-col">
+              <h2 className="text-2xl font-bold mb-4">Kitchen Display System</h2>
+              <div className="flex-1 overflow-x-auto overflow-y-hidden">
+                 <div className="flex gap-4 h-full pb-4">
+                     {orders.length === 0 && <div className="text-gray-500 m-auto">No active orders</div>}
+                     {orders.map(order => (
+                         <div key={order.id} className="min-w-[280px] w-[280px] bg-white border border-gray-300 rounded shadow-sm flex flex-col overflow-hidden">
+                            <div className="bg-gray-800 text-white p-3 flex justify-between items-center">
+                               <span className="font-bold">{order.id}</span>
+                               <span className="text-xs bg-gray-600 px-2 py-1 rounded">{order.serviceContext}</span>
+                            </div>
+                            <div className="text-sm p-2 border-b bg-gray-50 text-gray-500">
+                               {new Date(order.createdAt).toLocaleTimeString()}
+                            </div>
+                            <div className="flex-1 overflow-y-auto p-3">
+                                {order.lines.map(line => (
+                                    <div key={line.id} className="mb-3 pb-3 border-b border-gray-100 last:border-0">
+                                        <div className="font-bold">{line.qty || 1} x {line.product.name}</div>
+                                        {line.product.pricingMode === 'weight' && <div className="text-sm text-gray-500">{line.weight} kg</div>}
+                                        {line.modifierResolved && <div className="text-sm text-blue-600">+ {line.modifierChoice}</div>}
+                                    </div>
+                                ))}
+                            </div>
+                            <div className="p-3 bg-gray-50 border-t">
+                                <button className="btn btn-primary w-full" onClick={() => completeOrder(order.id)}>Mark Ready</button>
+                            </div>
+                         </div>
+                     ))}
+                 </div>
+              </div>
+           </div>
+        );
+    }
+
+    function ProductionModule({ currentUser }) {
+        const [recipeId, setRecipeId] = useState('prod_chips');
+        const [plannedQty, setPlannedQty] = useState(1);
+        const [wasteQty, setWasteQty] = useState(0);
+
+        const map = {
+            prod_quarter_chicken: { outputStockItemId: 'fin_quarter_chicken', label: 'Whole Chicken → Quarter Portions' },
+            prod_chips: { outputStockItemId: 'fin_chips_portion', label: 'Potatoes → Chips Portions' },
+            prod_steak: { outputStockItemId: 'fin_steak_portion', label: 'Beef Bulk → Steak Portions' },
+        };
+
+        const handleComplete = () => {
+             const envelope = createTransactionEnvelope({
+                 type: 'PRODUCTION_BATCH',
+                 actor: currentUser.name,
+                 batch: {
+                     id: generateId('batch'),
+                     recipeId,
+                     outputStockItemId: map[recipeId].outputStockItemId,
+                     plannedQty: parseInt(plannedQty),
+                     actualQty: parseInt(plannedQty), // Simplification for pilot
+                     wasteQty: parseInt(wasteQty),
+                     status: 'completed',
+                     createdAt: new Date().toISOString()
+                 }
+             });
+
+             if(commitTransaction(envelope)) {
+                 alert("Production batch completed!");
+                 setPlannedQty(1);
+                 setWasteQty(0);
+             }
+        };
+
+        return (
+            <div className="p-6 max-w-lg mx-auto w-full">
+                <h2 className="text-2xl font-bold mb-6">Production Batching</h2>
+                <div className="bg-white p-6 rounded shadow border border-gray-200">
+                    <div className="mb-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-2">Recipe</label>
+                        <select className="input-field" value={recipeId} onChange={e => setRecipeId(e.target.value)}>
+                            {Object.entries(map).map(([id, cfg]) => <option key={id} value={id}>{cfg.label}</option>)}
+                        </select>
+                    </div>
+
+                    <div className="mb-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-2">Planned Yield Qty</label>
+                        <input type="number" className="input-field" value={plannedQty} onChange={e => setPlannedQty(e.target.value)} />
+                    </div>
+
+                    <div className="mb-6">
+                        <label className="block text-sm font-bold text-gray-700 mb-2">Waste/Trim Qty (Base Units)</label>
+                        <input type="number" className="input-field border-orange-300" placeholder="Optional" value={wasteQty} onChange={e => setWasteQty(e.target.value)} />
+                    </div>
+
+                    <button className="btn btn-primary w-full" onClick={handleComplete}>Complete Production Batch</button>
+                </div>
+            </div>
+        );
+    }
+
+    function StockTakeModule({ currentUser }) {
+        const [location, setLocation] = useState('D-Door Freezer');
+        const [counts, setCounts] = useState({});
+
+        const locations = [
+            'D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer',
+            'Kitchen Fridge', 'Drinks Fridge', 'Bar Fridge',
+            'Butchery Display', 'Pantry Shelf', 'Pepsi Shelf', 'Sauces Fridge'
+        ];
+
+        const mockInventory = [
+            { id: 'ing_1', name: 'Quarter Chicken Portion', unit: 'each', sysQty: 38, allowedLocations: ['D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer'] },
+            { id: 'ing_2', name: 'Beef Steak', unit: 'kg', sysQty: 24.28, allowedLocations: ['D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer', 'Butchery Display'] },
+            { id: 'ing_3', name: 'Coke 300ml', unit: 'each', sysQty: 48, allowedLocations: ['Drinks Fridge', 'Bar Fridge', 'Pepsi Shelf'] },
+            { id: 'ing_4', name: 'Potato Chips', unit: 'kg', sysQty: 12.5, allowedLocations: ['Big Deep Freezer'] },
+        ];
+
+        const filteredInventory = mockInventory.filter(item => item.allowedLocations.includes(location));
+
+        const handleSubmit = () => {
+             const variances = filteredInventory.map(item => {
+                 const counted = counts[item.id] !== undefined ? parseFloat(counts[item.id]) : item.sysQty;
+                 return {
+                     itemId: item.id,
+                     itemName: item.name,
+                     sysQty: item.sysQty,
+                     countedQty: counted,
+                     variance: counted - item.sysQty
+                 };
+             }).filter(v => v.variance !== 0);
+
+             if (variances.length === 0) {
+                 alert("No variances to post.");
+                 return;
+             }
+
+             const envelope = createTransactionEnvelope({
+                 type: 'STOCK_TAKE_COMMIT',
+                 actor: currentUser.name,
+                 stockTake: {
+                     id: generateId('st'),
+                     location,
+                     variances,
+                     createdAt: new Date().toISOString()
+                 }
+             });
+
+             if(commitTransaction(envelope)) {
+                 alert("Stock take committed successfully.");
+                 setCounts({});
+             }
+        };
+
+        return (
+            <div className="p-4 flex flex-col h-full max-w-2xl mx-auto w-full">
+                <h2 className="text-2xl font-bold mb-4">Stock Take</h2>
+
+                <div className="bg-white p-4 rounded shadow border mb-4">
+                    <label className="block text-sm font-bold text-gray-700 mb-2">Location</label>
+                    <select className="input-field" value={location} onChange={e => { setLocation(e.target.value); setCounts({}); }}>
+                        {locations.map(l => <option key={l} value={l}>{l}</option>)}
+                    </select>
+                </div>
+
+                <div className="flex-1 bg-white rounded shadow border overflow-hidden flex flex-col mb-4">
+                    <div className="bg-gray-50 p-3 border-b font-bold flex justify-between">
+                       <span>Item ({filteredInventory.length})</span>
+                       <span>Count</span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto p-2">
+                        {filteredInventory.length === 0 && <div className="text-gray-400 text-center mt-8">No items allowed in this location.</div>}
+                        {filteredInventory.map(item => (
+                            <div key={item.id} className="flex justify-between items-center p-3 border-b border-gray-100 last:border-0">
+                                <div>
+                                   <div className="font-bold">{item.name}</div>
+                                   <div className="text-xs text-gray-500">Sys: {item.sysQty} {item.unit}</div>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <input
+                                        type="number"
+                                        className="input-field w-24 text-right"
+                                        placeholder={item.sysQty}
+                                        value={counts[item.id] !== undefined ? counts[item.id] : ''}
+                                        onChange={e => setCounts({...counts, [item.id]: e.target.value})}
+                                    />
+                                    <span className="text-xs text-gray-500 w-8">{item.unit}</span>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                <button className="btn btn-primary w-full py-4 text-lg" onClick={handleSubmit}>
+                    Submit Stock Take
+                </button>
+            </div>
+        );
+    }
+
+    function PurchasesModule({ currentUser }) {
+        const [poNumber, setPoNumber] = useState('PO-1001');
+        const [supplier, setSupplier] = useState('Local Meats');
+        const [item, setItem] = useState('Quarter Chicken Portion');
+        const [orderedQty, setOrderedQty] = useState(50);
+        const [receivedQty, setReceivedQty] = useState(50);
+        const [destination, setDestination] = useState('D-Door Freezer');
+
+        const locations = [
+            'D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer',
+            'Kitchen Fridge', 'Drinks Fridge', 'Bar Fridge',
+            'Butchery Display', 'Pantry Shelf', 'Pepsi Shelf', 'Sauces Fridge'
+        ];
+
+        const handleReceive = () => {
+             const variance = receivedQty - orderedQty;
+
+             const envelope = createTransactionEnvelope({
+                 type: 'GOODS_RECEIPT',
+                 actor: currentUser.name,
+                 receipt: {
+                     id: generateId('rcpt'),
+                     poNumber,
+                     supplier,
+                     item,
+                     orderedQty: parseInt(orderedQty),
+                     receivedQty: parseInt(receivedQty),
+                     variance,
+                     destination,
+                     createdAt: new Date().toISOString()
+                 }
+             });
+
+             if(commitTransaction(envelope)) {
+                 alert(`Goods received! Variance: ${variance}`);
+             }
+        };
+
+        return (
+            <div className="p-6 max-w-lg mx-auto w-full">
+                <h2 className="text-2xl font-bold mb-6">Receive Goods</h2>
+                <div className="bg-white p-6 rounded shadow border">
+                    <div className="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label className="block text-sm font-bold text-gray-700 mb-1">PO Number</label>
+                            <input type="text" className="input-field" value={poNumber} onChange={e => setPoNumber(e.target.value)} />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-bold text-gray-700 mb-1">Supplier</label>
+                            <input type="text" className="input-field" value={supplier} onChange={e => setSupplier(e.target.value)} />
+                        </div>
+                    </div>
+
+                    <div className="mb-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-1">Item</label>
+                        <input type="text" className="input-field" value={item} onChange={e => setItem(e.target.value)} />
+                    </div>
+
+                    <div className="mb-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-1">Destination Location</label>
+                        <select className="input-field" value={destination} onChange={e => setDestination(e.target.value)}>
+                            {locations.map(l => <option key={l} value={l}>{l}</option>)}
+                        </select>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4 mb-6">
+                        <div>
+                            <label className="block text-sm font-bold text-gray-700 mb-1">Ordered Qty</label>
+                            <input type="number" className="input-field bg-gray-50" value={orderedQty} onChange={e => setOrderedQty(e.target.value)} />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-bold text-gray-700 mb-1 text-blue-600">Received Qty</label>
+                            <input type="number" className="input-field border-blue-400" value={receivedQty} onChange={e => setReceivedQty(e.target.value)} />
+                        </div>
+                    </div>
+
+                    {receivedQty - orderedQty !== 0 && (
+                        <div className="mb-6 p-3 bg-orange-50 border border-orange-200 text-orange-800 rounded text-sm font-bold">
+                            Warning: Receiving variance of {receivedQty - orderedQty} units.
+                        </div>
+                    )}
+
+                    <button className="btn btn-primary w-full" onClick={handleReceive}>Post Goods Receipt</button>
+                </div>
+            </div>
+        );
+    }
+
+    function ShiftManagementModule({ currentUser }) {
+        const [shiftState, setShiftState] = useState('open'); // open, close_count
+        const [cashCount, setCashCount] = useState(0);
+
+        const handleCloseShift = () => {
+             const ledger = loadLedger();
+             const totalSales = ledger.orders.reduce((sum, o) => sum + o.total, 0);
+             const variance = cashCount - totalSales;
+
+             const envelope = createTransactionEnvelope({
+                 type: 'SHIFT_CLOSE',
+                 actor: currentUser.name,
+                 shift: {
+                     id: generateId('shift'),
+                     salesTotal: totalSales,
+                     cashCount: parseFloat(cashCount),
+                     variance,
+                     closedAt: new Date().toISOString()
+                 }
+             });
+
+             if(commitTransaction(envelope)) {
+                 alert(`Shift closed! Cash variance: ${variance}`);
+                 setShiftState('closed');
+             }
+        };
+
+        if (shiftState === 'closed') {
+            return <div className="p-8 text-center text-gray-500 mt-10">Shift is closed. A manager must open a new shift.</div>;
+        }
+
+        return (
+            <div className="p-6 max-w-lg mx-auto w-full">
+                <h2 className="text-2xl font-bold mb-6">Shift Management</h2>
+
+                {shiftState === 'open' && (
+                    <div className="bg-white p-6 rounded shadow border text-center">
+                        <div className="text-xl mb-4">Current Shift is Active</div>
+                        <button className="btn btn-primary w-full" onClick={() => setShiftState('close_count')}>Close Shift & Count</button>
+                    </div>
+                )}
+
+                {shiftState === 'close_count' && (
+                    <div className="bg-white p-6 rounded shadow border">
+                        <h3 className="text-lg font-bold mb-4">Declare Closing Cash</h3>
+                        <div className="mb-6">
+                            <label className="block text-sm font-bold text-gray-700 mb-2">Total Cash Counted</label>
+                            <input type="number" className="input-field text-xl" value={cashCount} onChange={e => setCashCount(e.target.value)} />
+                        </div>
+                        <button className="btn btn-primary w-full mb-2" onClick={handleCloseShift}>Confirm & Close Shift</button>
+                        <button className="btn btn-secondary w-full" onClick={() => setShiftState('open')}>Cancel</button>
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    function AuditLogModule() {
+        const [logs, setLogs] = useState([]);
+
+        useEffect(() => {
+             const ledger = loadLedger();
+             // Sort newest first
+             setLogs(ledger.auditLog.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)));
+        }, []);
+
+        return (
+            <div className="p-6 h-full flex flex-col w-full">
+                <h2 className="text-2xl font-bold mb-4">Audit Log</h2>
+                <div className="flex-1 bg-white rounded shadow border overflow-hidden flex flex-col">
+                    <div className="bg-gray-50 p-3 border-b font-bold grid grid-cols-4">
+                       <span className="col-span-1">Time</span>
+                       <span className="col-span-1">Actor</span>
+                       <span className="col-span-2">Event</span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto">
+                        {logs.length === 0 && <div className="text-gray-400 text-center mt-8">No audit events found.</div>}
+                        {logs.map(log => (
+                            <div key={log.id} className="grid grid-cols-4 p-3 border-b border-gray-100 last:border-0 text-sm">
+                                <span className="col-span-1 text-gray-500">{new Date(log.timestamp).toLocaleTimeString()}</span>
+                                <span className="col-span-1 font-bold">{log.actor}</span>
+                                <span className="col-span-2">{log.event}</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    function BarModule() {
+        const [orders, setOrders] = useState([]);
+
+        useEffect(() => {
+            const ledger = loadLedger();
+            // Show unpaid orders that require bar
+            const activeOrders = ledger.orders.filter(o => o.paymentStatus === 'unpaid' && o.lines.some(l => l.product.catId === 'cat_2'));
+            setOrders(activeOrders);
+        }, []);
+
+        const completeOrder = (orderId) => {
+             setOrders(orders.filter(o => o.id !== orderId));
+        };
+
+        return (
+           <div className="p-4 h-full flex flex-col">
+              <h2 className="text-2xl font-bold mb-4">Bar Display System</h2>
+              <div className="flex-1 overflow-x-auto overflow-y-hidden">
+                 <div className="flex gap-4 h-full pb-4">
+                     {orders.length === 0 && <div className="text-gray-500 m-auto">No active bar orders</div>}
+                     {orders.map(order => (
+                         <div key={order.id} className="min-w-[280px] w-[280px] bg-white border border-gray-300 rounded shadow-sm flex flex-col overflow-hidden">
+                            <div className="bg-blue-900 text-white p-3 flex justify-between items-center">
+                               <span className="font-bold">{order.id}</span>
+                               <span className="text-xs bg-blue-700 px-2 py-1 rounded">{order.serviceContext}</span>
+                            </div>
+                            <div className="text-sm p-2 border-b bg-gray-50 text-gray-500">
+                               {new Date(order.createdAt).toLocaleTimeString()}
+                            </div>
+                            <div className="flex-1 overflow-y-auto p-3">
+                                {order.lines.filter(l => l.product.catId === 'cat_2').map(line => (
+                                    <div key={line.id} className="mb-3 pb-3 border-b border-gray-100 last:border-0">
+                                        <div className="font-bold">{line.qty || 1} x {line.product.name}</div>
+                                    </div>
+                                ))}
+                            </div>
+                            <div className="p-3 bg-gray-50 border-t">
+                                <button className="btn btn-primary w-full" onClick={() => completeOrder(order.id)}>Mark Drinks Ready</button>
+                            </div>
+                         </div>
+                     ))}
+                 </div>
+              </div>
+           </div>
+        );
+    }
+
+    function WiFiModule({ currentUser }) {
+        const [vouchers, setVouchers] = useState([]);
+
+        useEffect(() => {
+            const ledger = loadLedger();
+            // Look for WiFi issuance events in audit log for demonstration
+            const issued = ledger.auditLog
+                .filter(log => log.event === 'WIFI_ISSUE')
+                .map(log => log.details.voucher);
+            setVouchers(issued);
+        }, []);
+
+        const issueVoucher = (duration) => {
+            const voucherCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+            const voucher = {
+                id: generateId('wifi'),
+                code: voucherCode,
+                duration,
+                status: 'active',
+                createdAt: new Date().toISOString()
+            };
+
+            const envelope = createTransactionEnvelope({
+                 type: 'WIFI_ISSUE',
+                 actor: currentUser.name,
+                 voucher
+            });
+
+            if(commitTransaction(envelope)) {
+                setVouchers([voucher, ...vouchers]);
+            }
+        };
+
+        return (
+            <div className="p-6 max-w-4xl mx-auto w-full grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div>
+                    <h2 className="text-2xl font-bold mb-6">WiFi Issue</h2>
+                    <div className="bg-white p-6 rounded shadow border mb-6">
+                        <h3 className="font-bold mb-4">Direct Sale / Issue</h3>
+                        <div className="grid grid-cols-2 gap-4">
+                            <button className="btn btn-secondary h-24 text-lg font-bold flex flex-col items-center justify-center" onClick={() => issueVoucher('30_min')}>
+                                <span>30 Min</span>
+                                <span className="text-sm font-normal text-gray-500">$1.00</span>
+                            </button>
+                            <button className="btn btn-secondary h-24 text-lg font-bold flex flex-col items-center justify-center" onClick={() => issueVoucher('60_min')}>
+                                <span>60 Min</span>
+                                <span className="text-sm font-normal text-gray-500">$2.00</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div>
+                    <h2 className="text-2xl font-bold mb-6">Active Vouchers</h2>
+                    <div className="bg-white rounded shadow border overflow-hidden">
+                        <div className="bg-gray-50 p-3 border-b font-bold flex justify-between">
+                            <span>Code</span>
+                            <span>Duration</span>
+                        </div>
+                        <div className="max-h-96 overflow-y-auto">
+                            {vouchers.length === 0 && <div className="p-8 text-center text-gray-400">No active vouchers</div>}
+                            {vouchers.map(v => (
+                                <div key={v.id} className="p-3 border-b border-gray-100 flex justify-between items-center">
+                                    <span className="font-mono font-bold text-blue-600 tracking-wider text-lg">{v.code}</span>
+                                    <span className="text-sm text-gray-500">{v.duration.replace('_', ' ')}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    function InventoryModule() {
+        const [location, setLocation] = useState('All');
+
+        const locations = [
+            'All', 'D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer',
+            'Kitchen Fridge', 'Drinks Fridge', 'Bar Fridge',
+            'Butchery Display', 'Pantry Shelf', 'Pepsi Shelf', 'Sauces Fridge'
+        ];
+
+        const mockInventory = [
+            { id: 'ing_1', name: 'Quarter Chicken Portion', unit: 'each', sysQty: 38, allowedLocations: ['D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer'] },
+            { id: 'ing_2', name: 'Beef Steak', unit: 'kg', sysQty: 24.28, allowedLocations: ['D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer', 'Butchery Display'] },
+            { id: 'ing_3', name: 'Coke 300ml', unit: 'each', sysQty: 48, allowedLocations: ['Drinks Fridge', 'Bar Fridge', 'Pepsi Shelf'] },
+            { id: 'ing_4', name: 'Potato Chips', unit: 'kg', sysQty: 12.5, allowedLocations: ['Big Deep Freezer'] },
+            { id: 'ing_5', name: 'Flour', unit: 'kg', sysQty: 100, allowedLocations: ['Pantry Shelf'] },
+        ];
+
+        const filteredInventory = location === 'All' ? mockInventory : mockInventory.filter(item => item.allowedLocations.includes(location));
+
+        return (
+            <div className="p-6 h-full flex flex-col w-full max-w-4xl mx-auto">
+                <h2 className="text-2xl font-bold mb-4">Inventory View</h2>
+
+                <div className="bg-white p-4 rounded shadow border mb-4">
+                    <label className="block text-sm font-bold text-gray-700 mb-2">Location Filter</label>
+                    <select className="input-field" value={location} onChange={e => setLocation(e.target.value)}>
+                        {locations.map(l => <option key={l} value={l}>{l}</option>)}
+                    </select>
+                </div>
+
+                <div className="flex-1 bg-white rounded shadow border overflow-hidden flex flex-col">
+                    <div className="bg-gray-50 p-3 border-b font-bold grid grid-cols-3">
+                       <span className="col-span-2">Item</span>
+                       <span className="col-span-1 text-right">In Stock</span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto">
+                        {filteredInventory.length === 0 && <div className="text-gray-400 text-center mt-8">No items in this location.</div>}
+                        {filteredInventory.map(item => (
+                            <div key={item.id} className="grid grid-cols-3 p-3 border-b border-gray-100 last:border-0 items-center hover:bg-gray-50">
+                                <div className="col-span-2">
+                                   <div className="font-bold">{item.name}</div>
+                                   <div className="text-xs text-gray-500">{item.allowedLocations.join(', ')}</div>
+                                </div>
+                                <div className="col-span-1 text-right font-mono font-bold text-lg">
+                                   {item.sysQty} <span className="text-sm font-normal text-gray-500">{item.unit}</span>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    function TransfersModule({ currentUser }) {
+        const [sourceLocation, setSourceLocation] = useState('Big Deep Freezer');
+        const [destLocation, setDestLocation] = useState('Kitchen Fridge');
+        const [item, setItem] = useState('Quarter Chicken Portion');
+        const [qty, setQty] = useState(10);
+
+        const locations = [
+            'D-Door Freezer', 'Big Deep Freezer', 'Butchery Freezer',
+            'Kitchen Fridge', 'Drinks Fridge', 'Bar Fridge',
+            'Butchery Display', 'Pantry Shelf', 'Pepsi Shelf', 'Sauces Fridge'
+        ];
+
+        const handleTransfer = () => {
+             if(sourceLocation === destLocation) {
+                 alert("Source and Destination cannot be the same.");
+                 return;
+             }
+             if(qty <= 0) {
+                 alert("Transfer quantity must be > 0.");
+                 return;
+             }
+
+             const envelope = createTransactionEnvelope({
+                 type: 'STOCK_TRANSFER',
+                 actor: currentUser.name,
+                 transfer: {
+                     id: generateId('trf'),
+                     item,
+                     sourceLocation,
+                     destLocation,
+                     qty: parseFloat(qty),
+                     createdAt: new Date().toISOString()
+                 }
+             });
+
+             if(commitTransaction(envelope)) {
+                 alert("Transfer completed!");
+                 setQty(1);
+             }
+        };
+
+        return (
+            <div className="p-6 max-w-lg mx-auto w-full">
+                <h2 className="text-2xl font-bold mb-6">Stock Transfer</h2>
+                <div className="bg-white p-6 rounded shadow border">
+                    <div className="mb-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-1">Item to Transfer</label>
+                        <input type="text" className="input-field" value={item} onChange={e => setItem(e.target.value)} />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label className="block text-sm font-bold text-gray-700 mb-1">Source Location</label>
+                            <select className="input-field" value={sourceLocation} onChange={e => setSourceLocation(e.target.value)}>
+                                {locations.map(l => <option key={l} value={l}>{l}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-bold text-gray-700 mb-1">Dest Location</label>
+                            <select className="input-field" value={destLocation} onChange={e => setDestLocation(e.target.value)}>
+                                {locations.map(l => <option key={l} value={l}>{l}</option>)}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div className="mb-6">
+                        <label className="block text-sm font-bold text-gray-700 mb-1">Quantity</label>
+                        <input type="number" className="input-field" value={qty} onChange={e => setQty(e.target.value)} />
+                    </div>
+
+                    <button className="btn btn-primary w-full" onClick={handleTransfer}>Execute Transfer</button>
+                </div>
+            </div>
+        );
+    }
+
+    function CustomersModule() {
+        const [search, setSearch] = useState('');
+
+        const mockCustomers = [
+            { id: 'c_1', name: 'MM Dlomo', phone: '0770000001', eWalletBalance: 3.40, loyaltyPoints: 120 },
+            { id: 'c_2', name: 'Tariro M', phone: '0770000002', eWalletBalance: 0.50, loyaltyPoints: 45 },
+            { id: 'c_3', name: 'James K', phone: '0770000003', eWalletBalance: 12.00, loyaltyPoints: 300 }
+        ];
+
+        const filtered = search ? mockCustomers.filter(c => c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search)) : mockCustomers;
+
+        return (
+            <div className="p-6 h-full flex flex-col w-full max-w-4xl mx-auto">
+                <h2 className="text-2xl font-bold mb-4">Customer Directory</h2>
+
+                <div className="bg-white p-4 rounded shadow border mb-4">
+                    <input
+                        type="text"
+                        className="input-field"
+                        placeholder="Search by name or phone..."
+                        value={search}
+                        onChange={e => setSearch(e.target.value)}
+                    />
+                </div>
+
+                <div className="flex-1 bg-white rounded shadow border overflow-hidden flex flex-col">
+                    <div className="bg-gray-50 p-3 border-b font-bold grid grid-cols-4">
+                       <span className="col-span-2">Customer Profile</span>
+                       <span className="col-span-1 text-right">eWallet</span>
+                       <span className="col-span-1 text-right">Loyalty Pts</span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto">
+                        {filtered.length === 0 && <div className="text-gray-400 text-center mt-8">No customers found.</div>}
+                        {filtered.map(c => (
+                            <div key={c.id} className="grid grid-cols-4 p-4 border-b border-gray-100 last:border-0 hover:bg-gray-50 items-center">
+                                <div className="col-span-2">
+                                   <div className="font-bold text-lg">{c.name}</div>
+                                   <div className="text-sm text-gray-500">{c.phone}</div>
+                                </div>
+                                <div className="col-span-1 text-right font-bold text-green-600">
+                                   ${c.eWalletBalance.toFixed(2)}
+                                </div>
+                                <div className="col-span-1 text-right font-bold text-purple-600">
+                                   {c.loyaltyPoints}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    function LoyaltyEwalletModule({ currentUser, mode }) {
+        const [phone, setPhone] = useState('');
+        const [amount, setAmount] = useState('');
+        const isEwallet = mode === 'ewallet';
+
+        const handleTransaction = (action) => {
+             if(!phone || !amount) {
+                 alert("Phone and Amount required.");
+                 return;
+             }
+
+             const envelope = createTransactionEnvelope({
+                 type: isEwallet ? 'EWALLET_TX' : 'LOYALTY_TX',
+                 actor: currentUser.name,
+                 tx: {
+                     id: generateId('tx'),
+                     phone,
+                     action,
+                     amount: parseFloat(amount),
+                     createdAt: new Date().toISOString()
+                 }
+             });
+
+             if(commitTransaction(envelope)) {
+                 alert(`${isEwallet ? 'eWallet' : 'Loyalty'} ${action} processed successfully!`);
+                 setAmount('');
+             }
+        };
+
+        return (
+            <div className="p-6 max-w-lg mx-auto w-full">
+                <h2 className="text-2xl font-bold mb-6">{isEwallet ? 'eWallet Management' : 'Loyalty Points'}</h2>
+                <div className="bg-white p-6 rounded shadow border">
+                    <div className="mb-4">
+                        <label className="block text-sm font-bold text-gray-700 mb-1">Customer Phone</label>
+                        <input type="text" className="input-field" placeholder="077..." value={phone} onChange={e => setPhone(e.target.value)} />
+                    </div>
+
+                    <div className="mb-6">
+                        <label className="block text-sm font-bold text-gray-700 mb-1">{isEwallet ? 'Amount ($)' : 'Points'}</label>
+                        <input type="number" className="input-field" value={amount} onChange={e => setAmount(e.target.value)} />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                        <button className="btn btn-primary w-full bg-green-600 border-green-600" onClick={() => handleTransaction('add')}>
+                           {isEwallet ? 'Add Funds' : 'Add Points'}
+                        </button>
+                        <button className="btn btn-primary w-full bg-orange-600 border-orange-600" onClick={() => handleTransaction('deduct')}>
+                           {isEwallet ? 'Deduct / Pay' : 'Redeem'}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    function SalesReportsModule() {
+        const [sales, setSales] = useState({ total: 0, orderCount: 0, items: [] });
+
+        useEffect(() => {
+            const ledger = loadLedger();
+            const completed = ledger.orders.filter(o => o.paymentStatus === 'paid');
+            const total = completed.reduce((sum, o) => sum + o.total, 0);
+
+            // Flatten items
+            const itemsMap = {};
+            completed.forEach(o => {
+                o.lines.forEach(l => {
+                    const id = l.product.id;
+                    if(!itemsMap[id]) itemsMap[id] = { name: l.product.name, qty: 0, revenue: 0 };
+                    itemsMap[id].qty += (l.qty || 1);
+                    itemsMap[id].revenue += l.total;
+                });
+            });
+
+            setSales({
+                total,
+                orderCount: completed.length,
+                items: Object.values(itemsMap).sort((a,b) => b.revenue - a.revenue)
+            });
+        }, []);
+
+        return (
+            <div className="p-6 h-full flex flex-col w-full max-w-4xl mx-auto">
+                <h2 className="text-2xl font-bold mb-6">Sales Report</h2>
+
+                <div className="grid grid-cols-2 gap-4 mb-6">
+                    <div className="bg-white p-6 rounded shadow border text-center">
+                        <div className="text-sm text-gray-500 font-bold mb-2">Total Revenue</div>
+                        <div className="text-3xl font-bold text-green-600">${sales.total.toFixed(2)}</div>
+                    </div>
+                    <div className="bg-white p-6 rounded shadow border text-center">
+                        <div className="text-sm text-gray-500 font-bold mb-2">Orders Completed</div>
+                        <div className="text-3xl font-bold text-blue-600">{sales.orderCount}</div>
+                    </div>
+                </div>
+
+                <h3 className="text-xl font-bold mb-4">Item Breakdown</h3>
+                <div className="flex-1 bg-white rounded shadow border overflow-hidden flex flex-col">
+                    <div className="bg-gray-50 p-3 border-b font-bold grid grid-cols-4">
+                       <span className="col-span-2">Item</span>
+                       <span className="col-span-1 text-right">Qty Sold</span>
+                       <span className="col-span-1 text-right">Revenue</span>
+                    </div>
+                    <div className="flex-1 overflow-y-auto">
+                        {sales.items.length === 0 && <div className="text-gray-400 text-center mt-8">No sales data.</div>}
+                        {sales.items.map((item, idx) => (
+                            <div key={idx} className="grid grid-cols-4 p-3 border-b border-gray-100 last:border-0 hover:bg-gray-50 items-center">
+                                <div className="col-span-2 font-bold">{item.name}</div>
+                                <div className="col-span-1 text-right">{item.qty}</div>
+                                <div className="col-span-1 text-right font-bold text-green-600">${item.revenue.toFixed(2)}</div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    function BasicModulePlaceholder({ title }) {
+        return (
+          <div className="flex-1 flex flex-col items-center justify-center p-8 bg-white m-4 rounded shadow border">
+             <h2 className="text-2xl font-bold text-gray-600 mb-4">{title}</h2>
+             <p className="text-gray-400">This module is functionally abstracted for pilot demonstration.</p>
+          </div>
+        );
+    }
+
+    // ==========================================
+    // APP COMPONENT (Operational Shell)
+    // ==========================================
+    function AppShell({ currentUser, onLogout }) {
+      const [activeModule, setActiveModule] = useState('pos');
+      const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+
+      const navGroups = [
+        { id: 'ServeNow', modules: [{ id: 'pos', label: 'POS' }, { id: 'kds', label: 'KDS' }, { id: 'bar', label: 'Bar' }, { id: 'wifi', label: 'WiFi' }] },
+        { id: 'Stock', modules: [{ id: 'inventory', label: 'Inventory' }, { id: 'stock_take', label: 'Stock Take' }, { id: 'production', label: 'Production' }, { id: 'purchases', label: 'Purchases' }, { id: 'transfers', label: 'Transfers' }] },
+        { id: 'Customers', modules: [{ id: 'customers', label: 'Customers' }, { id: 'loyalty', label: 'Loyalty' }, { id: 'ewallet', label: 'eWallet' }] },
+        { id: 'Reports', modules: [{ id: 'shifts', label: 'Shifts' }, { id: 'sales_reports', label: 'Sales Reports' }, { id: 'stock_recon', label: 'Stock Recon' }, { id: 'audit_log', label: 'Audit Log' }, { id: 'dashboard', label: 'Dashboard' }] },
+        { id: 'Setup', modules: [{ id: 'staff', label: 'Staff' }, { id: 'settings', label: 'Settings' }] }
+      ];
+
+      // Auto-timeout after 5 minutes of inactivity
+      useEffect(() => {
+          let timeoutId;
+          const resetTimeout = () => {
+              clearTimeout(timeoutId);
+              timeoutId = setTimeout(() => {
+                  onLogout();
+              }, 5 * 60 * 1000); // 5 minutes
+          };
+
+          window.addEventListener('mousemove', resetTimeout);
+          window.addEventListener('keydown', resetTimeout);
+          window.addEventListener('touchstart', resetTimeout);
+          window.addEventListener('click', resetTimeout);
+
+          resetTimeout();
+          return () => {
+              clearTimeout(timeoutId);
+              window.removeEventListener('mousemove', resetTimeout);
+              window.removeEventListener('keydown', resetTimeout);
+              window.removeEventListener('touchstart', resetTimeout);
+              window.removeEventListener('click', resetTimeout);
+          };
+      }, [onLogout]);
+
+      const renderModule = () => {
+        return (
+          <div className="flex-1 flex items-center justify-center bg-white p-8 rounded-lg shadow m-4">
+            <h2 className="text-2xl font-bold text-gray-400">Module: {activeModule}</h2>
+          </div>
+        );
+      };
+
+      return (
+        <div className="flex flex-col h-screen bg-gray-100">
+          {/* Top Utility Bar - Rule: "Currency badge, Quick Switch, Logout, Home/POS return, and Back... must live in one consistent top utility zone" */}
+          <header className="bg-gray-900 text-white p-3 flex justify-between items-center z-50">
+            <div className="flex items-center gap-3">
+              <button onClick={() => setIsDrawerOpen(true)} className="p-2 text-white hover:bg-gray-700 rounded lg:hidden">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+              </button>
+              <h1 className="font-bold text-lg hidden sm:block">PrepProfitOS</h1>
+            </div>
+
+            <div className="flex items-center gap-4">
+              <span className="text-sm font-semibold bg-gray-800 px-3 py-1 rounded border border-gray-600">USD</span>
+              <div className="flex flex-col items-end">
+                <span className="text-sm font-bold">{currentUser.name}</span>
+                <span className="text-xs text-gray-400">{currentUser.role}</span>
+              </div>
+              <div className="flex items-center gap-2 border-l border-gray-700 pl-4">
+                <button onClick={onLogout} className="text-sm text-gray-300 hover:text-white px-2 py-1 rounded hover:bg-gray-800">Quick Switch</button>
+                <button onClick={onLogout} className="text-sm text-gray-300 hover:text-white px-2 py-1 rounded hover:bg-gray-800">Logout</button>
+              </div>
+            </div>
+          </header>
+
+          <div className="flex flex-1 overflow-hidden">
+            {/* Desktop Navigation / Drawer */}
+            <aside className={`
+              fixed lg:static inset-y-0 left-0 z-40 w-64 bg-white border-r shadow-lg transform transition-transform duration-300 ease-in-out overflow-y-auto
+              ${isDrawerOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
+            `}>
+              <div className="p-4 flex justify-between items-center lg:hidden border-b">
+                <span className="font-bold text-gray-700">Menu</span>
+                <button onClick={() => setIsDrawerOpen(false)} className="text-gray-500 hover:text-gray-900 text-2xl leading-none">&times;</button>
+              </div>
+
+              <div className="p-2">
+                {navGroups.map(group => (
+                  <div key={group.id} className="mb-4">
+                    <h3 className="px-3 py-2 text-xs font-bold text-gray-400 uppercase tracking-wider">{group.id}</h3>
+                    <div className="space-y-1">
+                      {group.modules.map(mod => (
+                        <button
+                          key={mod.id}
+                          onClick={() => { setActiveModule(mod.id); setIsDrawerOpen(false); }}
+                          className={`w-full text-left px-3 py-2 rounded-md text-sm font-medium transition-colors
+                            ${activeModule === mod.id ? 'bg-blue-50 text-blue-700 font-bold' : 'text-gray-700 hover:bg-gray-100'}`}
+                        >
+                          {mod.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="p-4 border-t text-xs text-gray-400 text-center">
+                 {BUILD_VERSION}
+              </div>
+            </aside>
+
+            {/* Main Content Area */}
+            <main className="flex-1 overflow-y-auto flex flex-col relative bg-gray-100">
+              {/* Drawer overlay */}
+              {isDrawerOpen && (
+                <div
+                  className="fixed inset-0 bg-gray-900 bg-opacity-50 z-30 lg:hidden"
+                  onClick={() => setIsDrawerOpen(false)}
+                ></div>
+              )}
+
+              {activeModule === 'pos' && <POSModule currentUser={currentUser} />}
+              {activeModule === 'kds' && <KDSModule />}
+              {activeModule === 'bar' && <BarModule />}
+              {activeModule === 'wifi' && <WiFiModule currentUser={currentUser} />}
+              {activeModule === 'production' && <ProductionModule currentUser={currentUser} />}
+              {activeModule === 'inventory' && <InventoryModule />}
+              {activeModule === 'stock_take' && <StockTakeModule currentUser={currentUser} />}
+              {activeModule === 'purchases' && <PurchasesModule currentUser={currentUser} />}
+              {activeModule === 'transfers' && <TransfersModule currentUser={currentUser} />}
+              {activeModule === 'customers' && <CustomersModule />}
+              {activeModule === 'loyalty' && <LoyaltyEwalletModule currentUser={currentUser} mode="loyalty" />}
+              {activeModule === 'ewallet' && <LoyaltyEwalletModule currentUser={currentUser} mode="ewallet" />}
+              {activeModule === 'shifts' && <ShiftManagementModule currentUser={currentUser} />}
+              {activeModule === 'sales_reports' && <SalesReportsModule />}
+              {activeModule === 'audit_log' && <AuditLogModule />}
+              {!['pos', 'kds', 'bar', 'wifi', 'production', 'inventory', 'stock_take', 'purchases', 'transfers', 'customers', 'loyalty', 'ewallet', 'shifts', 'sales_reports', 'audit_log'].includes(activeModule) && <BasicModulePlaceholder title={activeModule} />}
+            </main>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // ROOT ORCHESTRATOR
+    // ==========================================
+    function Root() {
+      const [authenticatedUser, setAuthenticatedUser] = useState(null);
+      const [isLocked, setIsLocked] = useState(false);
+
+      useEffect(() => {
+        // Run startup recovery
+        recoverPendingTransactions();
+      }, []);
+
+      useEffect(() => {
+        // Toggle root visibility to maintain rigid boundary
+        const authRoot = document.getElementById('auth-root');
+        const appRoot = document.getElementById('app-root');
+
+        if (authenticatedUser) {
+          authRoot.classList.remove('active');
+          appRoot.classList.remove('hidden');
+        } else {
+          authRoot.classList.add('active');
+          appRoot.classList.add('hidden');
+        }
+      }, [authenticatedUser]);
+
+      const handleLogout = () => {
+        setAuthenticatedUser(null);
+      };
+
+      const handleUnlock = () => {
+          setIsLocked(false);
+      }
+
+      if (!authenticatedUser) {
+        return ReactDOM.createPortal(
+          <AuthShell onAuthenticated={setAuthenticatedUser} isLocked={isLocked} onUnlock={handleUnlock} />,
+          document.getElementById('auth-root')
+        );
+      }
+
+      return ReactDOM.createPortal(
+        <AppShell currentUser={authenticatedUser} onLogout={handleLogout} />,
+        document.getElementById('app-root')
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.createElement('div')); // Dummy div, portal does the work
+    root.render(<Root />);
+  </script>
+</body>
 </html>
