@@ -118,7 +118,7 @@ type AppState = {
 }
 
 const today = () => new Date().toISOString()
-const uid = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`
+const uid = (prefix: string) => `${prefix}_${crypto.randomUUID()}`
 
 const seedState = (): AppState => ({
   stockItems: [
